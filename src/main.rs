@@ -5,7 +5,11 @@ use openssl::rsa::Rsa;
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslStream};
 use openssl::x509::extension::SubjectKeyIdentifier;
 use openssl::x509::{X509NameBuilder, X509};
+use srtp2_sys::*;
+use std::ffi::c_void;
 use std::io::{self, Write};
+use std::mem::forget;
+use std::os::raw::c_int;
 use std::sync::Mutex;
 use std::{
     io::Read,
@@ -21,7 +25,7 @@ use stun::{
     message::{is_message, Setter, BINDING_REQUEST, BINDING_SUCCESS},
     xoraddr::XorMappedAddress,
 };
-
+use webrtc_util::marshal::{Marshal, MarshalSize, Unmarshal};
 use webrtc_util::KeyingMaterialExporter;
 
 // fn create_ssl_acceptor() -> Result<SslAcceptor, ErrorStack> {
@@ -82,6 +86,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let w: Arc<UdpSocket> = r.clone();
     let acceptor = create_ssl_acceptor().unwrap();
 
+    unsafe {
+        srtp_init();
+    }
     // let s = w.clone();
     let h = tokio::spawn(async move {
         // 接收到数据就转发到websocket
@@ -93,8 +100,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut hmac_key = [0u8; 20];
         let mut salt = [0u8; 14];
 
+        let mut client_aes_key = [0u8; 16];
+        let mut client_hmac_key = [0u8; 20];
+        let mut client_salt = [0u8; 14];
+
+        let mut pcm_file = std::fs::File::create("test.pcm").unwrap();
+
+        // let mut session = srtp::Session::with_inbound_template(srtp::StreamPolicy {
+        //     ..Default::default()
+        // })
+        // .unwrap();
+
         let session = Arc::new(Mutex::new(None));
 
+        let session_send = Arc::new(Mutex::new(None));
+
+        // match session.unprotect(&mut packet) {
+        //     Ok(()) => println!("SRTP packet unprotected"),
+        //     Err(err) => println!("Error unprotecting SRTP packet: {}", err),
+        // };
+
+        let mut rtp_seq = 0;
+        let mut timestamp = 2154u32;
         loop {
             let (len, addr) = socket.recv_from(&mut buf).unwrap();
             let socket = socket.try_clone().unwrap();
@@ -117,47 +144,93 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // ssl.write_all(b"Hello from DTLS server").unwrap();
 
                 // ssl.flush().unwrap();
+
                 // 16字节（AES密钥）+ 20字节（SHA-1 HMAC密钥）+ 14字节（盐值）= 50字节
-                let mut key_material = [0u8; 50];
+                // 分布方式 服务端aeskey,客户端aeskey,服务端sha1key,客户端sha1key,服务端salt,客户端salt
+                let mut key_material = [0u8; 100];
                 ssl.ssl()
-                    .export_keying_material(&mut key_material, "EXTRACTOR-DTLS-SRTP", None)
+                    .export_keying_material(&mut key_material, "EXTRACTOR-dtls_srtp", None)
                     .unwrap();
                 println!("key_material: {:x?}", &key_material[..]);
 
-                // 复制给 aes_key hmac_key salt
+                // // 复制给 aes_key hmac_key salt
                 aes_key.copy_from_slice(&key_material[..16]);
-                hmac_key.copy_from_slice(&key_material[16..36]);
-                salt.copy_from_slice(&key_material[36..]);
+                client_aes_key.copy_from_slice(&key_material[16..32]);
+                hmac_key.copy_from_slice(&key_material[32..52]);
+                client_hmac_key.copy_from_slice(&key_material[52..72]);
+                salt.copy_from_slice(&key_material[72..86]);
+                client_salt.copy_from_slice(&key_material[86..]);
 
-                println!("aes_key: {:x?}", aes_key);
-                println!("hmac_key: {:x?}", hmac_key);
-                println!("salt: {:x?}", salt);
+                // println!("aes_key: {:x?}", aes_key);
+                // println!("hmac_key: {:x?}", hmac_key);
+                // println!("salt: {:x?}", salt);
 
-                // key = aes_key + salt
-                let mut key = vec![]; // DO NOT USE IT ON PRODUCTION
-                key.extend_from_slice(&aes_key);
-                key.extend_from_slice(&salt);
-                key.extend_from_slice(&hmac_key);
                 // 重新复制session
-                let new_session = srtp::Session::with_inbound_template(srtp::StreamPolicy {
-                    key: &key[..50],
-                    ..Default::default()
-                })
-                .unwrap();
-              
-                println!("key_material:{:x?}\nkey:{:x?}", key_material, key);
-            
+                // let new_session = srtp::Session::with_inbound_template(srtp::StreamPolicy {
+                //     key: &key_material[..30],
+                //     ..Default::default()
+                // })
+                // .unwrap();
+
+                let mut key = vec![];
+                key.extend_from_slice(&aes_key);
+                key.extend_from_slice(&hmac_key);
+                key.extend_from_slice(&salt);
+
+                let mut policy: srtp_policy_t = unsafe { std::mem::zeroed() };
+
+                // 接收rtp的策略
+                unsafe {
+                    srtp_crypto_policy_set_rtp_default(&mut policy.rtp);
+                    srtp_crypto_policy_set_rtcp_default(&mut policy.rtcp);
+                    policy.key = key.as_ptr() as *mut _;
+                    policy.ssrc.type_ = srtp_ssrc_type_t_ssrc_any_inbound;
+                    policy.next = std::ptr::null_mut();
+                }
+
+                println!("policy: {:#?}", &policy.rtp);
+
+                let mut t_session: srtp_t = std::ptr::null_mut();
+                unsafe {
+                    let status = srtp_create(&mut t_session, &policy);
+                    if (status != 0) {
+                        panic!("创建srtp session失败:{}", status);
+                    }
+                }
 
                 let mut session = session.lock().unwrap();
-                *session = Some(new_session);
-
+                *session = Some(t_session);
                 println!("结束握手");
-                // clients.push(client);
-                // loop {
-                //     let mut buf = [0u8; 1024];
-                //     let len = ssl.read(&mut buf).unwrap();
-                //     println!("received {} bytes from {}\n{:x?}\n", len, addr, &buf[..len]);
-                // }
+           
+
+                let mut client_key = vec![];
+                client_key.extend_from_slice(&client_aes_key);
+                client_key.extend_from_slice(&client_hmac_key);
+                client_key.extend_from_slice(&client_salt);
+                let mut policy: srtp_policy_t = unsafe { std::mem::zeroed() };
+
+                // 发送rtp的策略
+                unsafe {
+                    srtp_crypto_policy_set_rtp_default(&mut policy.rtp);
+                    srtp_crypto_policy_set_rtcp_default(&mut policy.rtcp);
+                    policy.key = client_key.as_ptr() as *mut _;
+                    policy.ssrc.type_ = srtp_ssrc_type_t_ssrc_specific;
+                    policy.ssrc.value = 1097637605u32;
+                    policy.next = std::ptr::null_mut();
+                }
+
+                println!("policy: {:#?}", &policy.rtp);
+
+                let mut t_session: srtp_t = std::ptr::null_mut();
+                unsafe {
+                    let status = srtp_create(&mut t_session, &policy);
+                    if (status != 0) {
+                        panic!("创建srtp session失败:{}", status);
+                    }
+                }
+
+                let mut session = session_send.lock().unwrap();
+                *session = Some(t_session);
 
                 continue;
             }
@@ -212,11 +285,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 解密srtp数据 data 使用 SRTP_AES128_CM_SHA1_80
 
             let mut packet = Vec::from(data);
-            if let Some(s) = session.lock().unwrap().as_mut() {
-                match s.unprotect(&mut packet) {
-                    Ok(()) => println!("解密后：{:?}", packet),
-                    Err(err) => println!("Error unprotecting SRTP packet: {}", err),
-                };
+            let mut len: c_int = packet.len() as c_int;
+            if let Some(s) = session.lock().unwrap().as_ref() {
+                unsafe {
+                    let ret =
+                        srtp_unprotect(s.clone(), packet.as_mut_ptr() as *mut c_void, &mut len);
+                    println!("解析返回值: {}", ret);
+                }
+                println!("解密后: \n{:x?}", &packet);
+
+                let mut buf = &packet[..];
+                let result = rtp::packet::Packet::unmarshal(&mut buf);
+                println!("解密结果:{:#?}", result);
+                if let Ok(rtp) = result {
+                    let data = rtp.payload.clone();
+                    println!("长度:{}", data.len());
+                    if rtp.header.payload_type == 8 {
+                        pcm_file.write_all(&data[..160]).unwrap();
+                        pcm_file.flush().unwrap();
+
+                        if let Some(s) = session_send.lock().unwrap().as_ref() {
+                            let mut packet = rtp.clone();
+                            packet.header.ssrc = 1097637605u32;
+                            packet.header.sequence_number = packet.header.sequence_number+160;
+                            packet.header.timestamp = timestamp;
+                            rtp_seq += 1;
+                            
+                            timestamp += 160;
+                            let mut packet_buf = Vec::with_capacity(1000);
+                            let t_buf = packet.marshal().unwrap();
+                            packet_buf.extend_from_slice(&t_buf);
+                            let mut len: c_int = packet_buf.len() as c_int;
+                            println!("加密前长度:{}", len);
+                            
+                            unsafe {
+                                let ret = srtp_protect(
+                                    s.clone(),
+                                    packet_buf.as_mut_ptr() as *mut c_void,
+                                    &mut len,
+                                );
+                                println!("加密返回值: {}", ret);
+                            }
+                            println!("加密后: 长度{}\t内容：\n{:x?}", len, &packet_buf);
+
+                            
+                            // unsafe {
+                            //     let ret = srtp_unprotect(
+                            //         s.clone(),
+                            //         packet_buf.as_mut_ptr() as *mut c_void,
+                            //         &mut len,
+                            //     );
+                            //     println!("服务端解析返回值: {}", ret);
+                            // }
+                            // println!("服务端解密后: \n{:x?}", &packet_buf);
+                            socket
+                                .try_clone()
+                                .unwrap()
+                                .send_to(&packet_buf, addr)
+                                .unwrap();
+                        }
+                    }
+                }
             }
         }
     });

@@ -11,6 +11,7 @@ stun = "*"
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 # ossl102
-openssl = { version = "*", features = ["v102"] }
+openssl = { version = "*", features = [] }
 webrtc-util = "*"
-srtp = "*"
+srtp2-sys = {version="3.0.2", features = []}
+rtp="*"
