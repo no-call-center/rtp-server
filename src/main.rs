@@ -96,13 +96,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // let mut clients = vec![];
         let a = acceptor.clone();
 
-        let mut aes_key = [0u8; 16];
-        let mut hmac_key = [0u8; 20];
-        let mut salt = [0u8; 14];
-
         let mut client_aes_key = [0u8; 16];
         let mut client_hmac_key = [0u8; 20];
         let mut client_salt = [0u8; 14];
+
+        let mut server_aes_key = [0u8; 16];
+        let mut server_hmac_key = [0u8; 20];
+        let mut server_salt = [0u8; 14];
 
         let mut pcm_file = std::fs::File::create("test.pcm").unwrap();
 
@@ -120,8 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         //     Err(err) => println!("Error unprotecting SRTP packet: {}", err),
         // };
 
-        let mut rtp_seq = 0;
-        let mut timestamp = 2154u32;
+        let mut rtp_seq = 32514;
+        let mut timestamp = 2487064536u32;
         loop {
             let (len, addr) = socket.recv_from(&mut buf).unwrap();
             let socket = socket.try_clone().unwrap();
@@ -146,91 +146,109 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // ssl.flush().unwrap();
 
                 // 16字节（AES密钥）+ 20字节（SHA-1 HMAC密钥）+ 14字节（盐值）= 50字节
-                // 分布方式 服务端aeskey,客户端aeskey,服务端sha1key,客户端sha1key,服务端salt,客户端salt
+                // 客户端aeskey,服务端aeskey,客户端sha1key,服务端sha1key,客户端salt,服务端salt
                 let mut key_material = [0u8; 100];
                 ssl.ssl()
                     .export_keying_material(&mut key_material, "EXTRACTOR-dtls_srtp", None)
                     .unwrap();
                 println!("key_material: {:x?}", &key_material[..]);
 
-                // // 复制给 aes_key hmac_key salt
-                aes_key.copy_from_slice(&key_material[..16]);
-                client_aes_key.copy_from_slice(&key_material[16..32]);
-                hmac_key.copy_from_slice(&key_material[32..52]);
-                client_hmac_key.copy_from_slice(&key_material[52..72]);
-                salt.copy_from_slice(&key_material[72..86]);
-                client_salt.copy_from_slice(&key_material[86..]);
+                // 复制给 aes_key hmac_key salt
+                // client_aes_key.copy_from_slice(&key_material[..16]);
+                // server_aes_key.copy_from_slice(&key_material[16..32]);
 
-                // println!("aes_key: {:x?}", aes_key);
-                // println!("hmac_key: {:x?}", hmac_key);
-                // println!("salt: {:x?}", salt);
+                // client_salt.copy_from_slice(&key_material[32..46]);
+                // server_salt.copy_from_slice(&key_material[46..60]);
+                // client_hmac_key.copy_from_slice(&key_material[60..80]);
+                // server_hmac_key.copy_from_slice(&key_material[80..100]);
 
-                // 重新复制session
-                // let new_session = srtp::Session::with_inbound_template(srtp::StreamPolicy {
-                //     key: &key_material[..30],
-                //     ..Default::default()
-                // })
-                // .unwrap();
-
-                let mut key = vec![];
-                key.extend_from_slice(&aes_key);
-                key.extend_from_slice(&hmac_key);
-                key.extend_from_slice(&salt);
-
-                let mut policy: srtp_policy_t = unsafe { std::mem::zeroed() };
-
-                // 接收rtp的策略
-                unsafe {
-                    srtp_crypto_policy_set_rtp_default(&mut policy.rtp);
-                    srtp_crypto_policy_set_rtcp_default(&mut policy.rtcp);
-                    policy.key = key.as_ptr() as *mut _;
-                    policy.ssrc.type_ = srtp_ssrc_type_t_ssrc_any_inbound;
-                    policy.next = std::ptr::null_mut();
-                }
-
-                println!("policy: {:#?}", &policy.rtp);
-
-                let mut t_session: srtp_t = std::ptr::null_mut();
-                unsafe {
-                    let status = srtp_create(&mut t_session, &policy);
-                    if (status != 0) {
-                        panic!("创建srtp session失败:{}", status);
-                    }
-                }
-
-                let mut session = session.lock().unwrap();
-                *session = Some(t_session);
-                println!("结束握手");
-           
+                client_aes_key.copy_from_slice(&key_material[..16]);
+                server_aes_key.copy_from_slice(&key_material[16..32]);
+                client_hmac_key.copy_from_slice(&key_material[32..52]);
+                server_hmac_key.copy_from_slice(&key_material[52..72]);
+                client_salt.copy_from_slice(&key_material[72..86]);
+                server_salt.copy_from_slice(&key_material[86..100]);
 
                 let mut client_key = vec![];
                 client_key.extend_from_slice(&client_aes_key);
-                client_key.extend_from_slice(&client_hmac_key);
-                client_key.extend_from_slice(&client_salt);
-                let mut policy: srtp_policy_t = unsafe { std::mem::zeroed() };
 
-                // 发送rtp的策略
+                client_key.extend_from_slice(&client_hmac_key);
+
+                client_key.extend_from_slice(&client_salt);
+
+                let mut server_key = vec![];
+                server_key.extend_from_slice(&server_aes_key);
+
+                server_key.extend_from_slice(&server_hmac_key);
+
+                server_key.extend_from_slice(&server_salt);
+
                 unsafe {
+                    let mut t_session: srtp_t = std::ptr::null_mut();
+                    let mut policy: srtp_policy_t = std::mem::zeroed();
+
                     srtp_crypto_policy_set_rtp_default(&mut policy.rtp);
                     srtp_crypto_policy_set_rtcp_default(&mut policy.rtcp);
-                    policy.key = client_key.as_ptr() as *mut _;
-                    policy.ssrc.type_ = srtp_ssrc_type_t_ssrc_specific;
-                    policy.ssrc.value = 1097637605u32;
+                    srtp_crypto_policy_set_from_profile_for_rtp(
+                        &mut policy.rtp,
+                        srtp_profile_t_srtp_profile_aes128_cm_sha1_80,
+                    );
+                    srtp_crypto_policy_set_from_profile_for_rtcp(
+                        &mut policy.rtcp,
+                        srtp_profile_t_srtp_profile_aes128_cm_sha1_80,
+                    );
+
+                    policy.ssrc.value = 0u32;
                     policy.next = std::ptr::null_mut();
-                }
 
-                println!("policy: {:#?}", &policy.rtp);
+                    policy.key = client_key.as_ptr() as *mut _;
+                    policy.ssrc.type_ = srtp_ssrc_type_t_ssrc_any_inbound;
 
-                let mut t_session: srtp_t = std::ptr::null_mut();
-                unsafe {
                     let status = srtp_create(&mut t_session, &policy);
                     if (status != 0) {
-                        panic!("创建srtp session失败:{}", status);
+                        panic!("创建srtp session失败2:{}", status);
                     }
+                    println!("policy2: {:#?}", policy);
+
+                    let mut session = session.lock().unwrap();
+                    *session = Some(t_session);
                 }
 
-                let mut session = session_send.lock().unwrap();
-                *session = Some(t_session);
+                unsafe {
+                    let mut t_session: srtp_t = std::ptr::null_mut();
+                    let mut policy: srtp_policy_t = std::mem::zeroed();
+
+                    srtp_crypto_policy_set_rtp_default(&mut policy.rtp);
+                    srtp_crypto_policy_set_rtcp_default(&mut policy.rtcp);
+                    srtp_crypto_policy_set_from_profile_for_rtp(
+                        &mut policy.rtp,
+                        srtp_profile_t_srtp_profile_aes128_cm_sha1_80,
+                    );
+                    srtp_crypto_policy_set_from_profile_for_rtcp(
+                        &mut policy.rtcp,
+                        srtp_profile_t_srtp_profile_aes128_cm_sha1_80,
+                    );
+
+                    policy.ssrc.value = 0u32;
+                    policy.next = std::ptr::null_mut();
+
+                    policy.key = server_key.as_ptr() as *mut _;
+                    policy.ssrc.type_ = srtp_ssrc_type_t_ssrc_any_outbound;
+
+                    let status = srtp_create(&mut t_session, &policy);
+                    if (status != 0) {
+                        panic!("创建srtp session失败2:{}", status);
+                    }
+                    println!("policy2: {:#?}", policy);
+
+                    let mut session = session_send.lock().unwrap();
+                    *session = Some(t_session);
+                }
+
+                println!("结束握手");
+
+                // let mut session = session_send.lock().unwrap();
+                // *session = Some(t_session);
 
                 continue;
             }
@@ -304,20 +322,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         pcm_file.write_all(&data[..160]).unwrap();
                         pcm_file.flush().unwrap();
 
+                        let mut packet = rtp::packet::Packet {
+                            header: rtp::header::Header {
+                                version: 2,
+                                padding: false,
+                                extension: false,
+                                marker: rtp.header.marker,
+                                payload_type: 8,
+                                sequence_number: rtp_seq,
+                                timestamp,
+                                ssrc: 1097637605u32,
+                                csrc: vec![],
+                                extension_profile: 0,
+                                ..Default::default()
+                            },
+                            payload: data.to_vec().into(),
+                        };
+                        timestamp += 160;
+                        rtp_seq += 1;
+
+                        let mut packet_buf = Vec::with_capacity(1000);
+                        let t_buf = packet.marshal().unwrap();
+                        packet_buf.extend_from_slice(&t_buf);
+                        let mut len: c_int = packet_buf.len() as c_int;
+                        println!("加密前长度:{}", len);
+
                         if let Some(s) = session_send.lock().unwrap().as_ref() {
-                            let mut packet = rtp.clone();
-                            packet.header.ssrc = 1097637605u32;
-                            packet.header.sequence_number = packet.header.sequence_number+160;
-                            packet.header.timestamp = timestamp;
-                            rtp_seq += 1;
-                            
-                            timestamp += 160;
-                            let mut packet_buf = Vec::with_capacity(1000);
-                            let t_buf = packet.marshal().unwrap();
-                            packet_buf.extend_from_slice(&t_buf);
-                            let mut len: c_int = packet_buf.len() as c_int;
-                            println!("加密前长度:{}", len);
-                            
                             unsafe {
                                 let ret = srtp_protect(
                                     s.clone(),
@@ -326,18 +356,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                                 println!("加密返回值: {}", ret);
                             }
-                            println!("加密后: 长度{}\t内容：\n{:x?}", len, &packet_buf);
+                            println!(
+                                "加密后: 长度{}\t内容：\n{:x?}",
+                                &packet_buf.len(),
+                                &packet_buf
+                            );
 
-                            
-                            // unsafe {
-                            //     let ret = srtp_unprotect(
-                            //         s.clone(),
-                            //         packet_buf.as_mut_ptr() as *mut c_void,
-                            //         &mut len,
-                            //     );
-                            //     println!("服务端解析返回值: {}", ret);
-                            // }
-                            // println!("服务端解密后: \n{:x?}", &packet_buf);
                             socket
                                 .try_clone()
                                 .unwrap()
