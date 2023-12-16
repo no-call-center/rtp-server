@@ -6,12 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rtp-rs = "*"
+rtp-rs = "0.6.0"
 stun = "*"
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 # ossl102
 openssl = { version = "*", features = [] }
-webrtc-util = "*"
 srtp2-sys = {version="3.0.2", features = []}
-rtp="*"

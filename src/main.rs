@@ -5,6 +5,7 @@ use openssl::rsa::Rsa;
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslStream};
 use openssl::x509::extension::SubjectKeyIdentifier;
 use openssl::x509::{X509NameBuilder, X509};
+use rtp_rs::*;
 use srtp2_sys::*;
 use std::ffi::c_void;
 use std::io::{self, Write};
@@ -19,14 +20,12 @@ use std::{
 use stun::agent::TransactionId;
 use stun::textattrs::Username;
 use stun::{
-    attributes::{ATTR_USERNAME, ATTR_XORMAPPED_ADDRESS},
+    attributes::ATTR_XORMAPPED_ADDRESS,
     fingerprint::FingerprintAttr,
     integrity::MessageIntegrity,
-    message::{is_message, Setter, BINDING_REQUEST, BINDING_SUCCESS},
+    message::{is_message, Setter, BINDING_SUCCESS},
     xoraddr::XorMappedAddress,
 };
-use webrtc_util::marshal::{Marshal, MarshalSize, Unmarshal};
-use webrtc_util::KeyingMaterialExporter;
 
 // fn create_ssl_acceptor() -> Result<SslAcceptor, ErrorStack> {
 //     // 生成RSA私钥
@@ -126,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (len, addr) = socket.recv_from(&mut buf).unwrap();
             let socket = socket.try_clone().unwrap();
             let a = a.clone();
-            println!("received {} bytes from {}\n{:x?}\n", len, addr, &buf[..len]);
+            // println!("received {} bytes from {}", len, addr);
 
             // 收到的udp数据
             let data = &buf[..len];
@@ -162,25 +161,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // client_hmac_key.copy_from_slice(&key_material[60..80]);
                 // server_hmac_key.copy_from_slice(&key_material[80..100]);
 
+                // 这个是正确的密钥分布
                 client_aes_key.copy_from_slice(&key_material[..16]);
                 server_aes_key.copy_from_slice(&key_material[16..32]);
-                client_hmac_key.copy_from_slice(&key_material[32..52]);
-                server_hmac_key.copy_from_slice(&key_material[52..72]);
-                client_salt.copy_from_slice(&key_material[72..86]);
-                server_salt.copy_from_slice(&key_material[86..100]);
+                client_salt.copy_from_slice(&key_material[32..46]);
+                server_salt.copy_from_slice(&key_material[46..60]);
 
                 let mut client_key = vec![];
                 client_key.extend_from_slice(&client_aes_key);
-
-                client_key.extend_from_slice(&client_hmac_key);
-
                 client_key.extend_from_slice(&client_salt);
 
                 let mut server_key = vec![];
                 server_key.extend_from_slice(&server_aes_key);
-
-                server_key.extend_from_slice(&server_hmac_key);
-
                 server_key.extend_from_slice(&server_salt);
 
                 unsafe {
@@ -205,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     policy.ssrc.type_ = srtp_ssrc_type_t_ssrc_any_inbound;
 
                     let status = srtp_create(&mut t_session, &policy);
-                    if (status != 0) {
+                    if status != 0 {
                         panic!("创建srtp session失败2:{}", status);
                     }
                     println!("policy2: {:#?}", policy);
@@ -220,14 +212,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     srtp_crypto_policy_set_rtp_default(&mut policy.rtp);
                     srtp_crypto_policy_set_rtcp_default(&mut policy.rtcp);
-                    srtp_crypto_policy_set_from_profile_for_rtp(
-                        &mut policy.rtp,
-                        srtp_profile_t_srtp_profile_aes128_cm_sha1_80,
-                    );
-                    srtp_crypto_policy_set_from_profile_for_rtcp(
-                        &mut policy.rtcp,
-                        srtp_profile_t_srtp_profile_aes128_cm_sha1_80,
-                    );
+                    // srtp_crypto_policy_set_from_profile_for_rtp(
+                    //     &mut policy.rtp,
+                    //     srtp_profile_t_srtp_profile_aes128_cm_sha1_80,
+                    // );
+                    // srtp_crypto_policy_set_from_profile_for_rtcp(
+                    //     &mut policy.rtcp,
+                    //     srtp_profile_t_srtp_profile_aes128_cm_sha1_80,
+                    // );
 
                     policy.ssrc.value = 0u32;
                     policy.next = std::ptr::null_mut();
@@ -236,7 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     policy.ssrc.type_ = srtp_ssrc_type_t_ssrc_any_outbound;
 
                     let status = srtp_create(&mut t_session, &policy);
-                    if (status != 0) {
+                    if status != 0 {
                         panic!("创建srtp session失败2:{}", status);
                     }
                     println!("policy2: {:#?}", policy);
@@ -297,6 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .send_to(&out_msg.raw, addr)
                     .unwrap();
                 // println!("结束dtls绑定");
+                continue;
             }
 
             // 到这里 基本就是srtp数据
@@ -305,70 +298,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut packet = Vec::from(data);
             let mut len: c_int = packet.len() as c_int;
             if let Some(s) = session.lock().unwrap().as_ref() {
-                unsafe {
-                    let ret =
-                        srtp_unprotect(s.clone(), packet.as_mut_ptr() as *mut c_void, &mut len);
-                    println!("解析返回值: {}", ret);
-                }
-                println!("解密后: \n{:x?}", &packet);
-
-                let mut buf = &packet[..];
-                let result = rtp::packet::Packet::unmarshal(&mut buf);
-                println!("解密结果:{:#?}", result);
-                if let Ok(rtp) = result {
-                    let data = rtp.payload.clone();
-                    println!("长度:{}", data.len());
-                    if rtp.header.payload_type == 8 {
-                        pcm_file.write_all(&data[..160]).unwrap();
-                        pcm_file.flush().unwrap();
-
-                        let mut packet = rtp::packet::Packet {
-                            header: rtp::header::Header {
-                                version: 2,
-                                padding: false,
-                                extension: false,
-                                marker: rtp.header.marker,
-                                payload_type: 8,
-                                sequence_number: rtp_seq,
-                                timestamp,
-                                ssrc: 1097637605u32,
-                                csrc: vec![],
-                                extension_profile: 0,
-                                ..Default::default()
-                            },
-                            payload: data.to_vec().into(),
-                        };
-                        timestamp += 160;
-                        rtp_seq += 1;
-
-                        let mut packet_buf = Vec::with_capacity(1000);
-                        let t_buf = packet.marshal().unwrap();
-                        packet_buf.extend_from_slice(&t_buf);
-                        let mut len: c_int = packet_buf.len() as c_int;
-                        println!("加密前长度:{}", len);
-
-                        if let Some(s) = session_send.lock().unwrap().as_ref() {
-                            unsafe {
-                                let ret = srtp_protect(
-                                    s.clone(),
-                                    packet_buf.as_mut_ptr() as *mut c_void,
-                                    &mut len,
-                                );
-                                println!("加密返回值: {}", ret);
-                            }
-                            println!(
-                                "加密后: 长度{}\t内容：\n{:x?}",
-                                &packet_buf.len(),
-                                &packet_buf
-                            );
-
-                            socket
-                                .try_clone()
-                                .unwrap()
-                                .send_to(&packet_buf, addr)
-                                .unwrap();
+                if is_rtp(&buf) {
+                    // rtp数据
+                    unsafe {
+                        let ret =
+                            srtp_unprotect(s.clone(), packet.as_mut_ptr() as *mut c_void, &mut len);
+                        if ret != 0 {
+                            println!("解析 rtp 返回值: {}, 数据：\n{:x?}\n", ret, &packet);
+                            continue;
                         }
                     }
+
+                    let result = RtpReader::new(&packet[..len as usize]);
+                    // println!("解密结果:{:#?}", result);
+                    if let Ok(rtp) = result {
+                        let payload = rtp.payload();
+                        // println!("长度:{}", payload.len());
+                        if rtp.payload_type() == 8 {
+                            pcm_file.write_all(&payload).unwrap();
+                            pcm_file.flush().unwrap();
+
+                            let packet = RtpPacketBuilder::new()
+                                .payload_type(8)
+                                .ssrc(1097637605u32)
+                                .sequence(Seq::from(rtp_seq))
+                                .timestamp(timestamp)
+                                .marked(rtp.mark())
+                                .payload(&payload)
+                                .build()
+                                .unwrap();
+                            timestamp += 160;
+                            rtp_seq += 1;
+
+                            let mut packet_buf = Vec::with_capacity(1000);
+                            packet_buf.extend_from_slice(&packet);
+                            let mut len: c_int = packet_buf.len() as c_int;
+                            // println!("加密前长度:{}", len);
+
+                            if let Some(s) = session_send.lock().unwrap().as_ref() {
+                                unsafe {
+                                    let ret = srtp_protect(
+                                        s.clone(),
+                                        packet_buf.as_mut_ptr() as *mut c_void,
+                                        &mut len,
+                                    );
+                                    if ret != 0 {
+                                        panic!("加密返回值: {}", ret);
+                                    }
+                                }
+
+                                // 不管是否越界 获取packet_buf的前len个字节
+                                unsafe {
+                                    packet_buf.set_len(len as usize);
+                                }
+
+                                // println!("加密后: 长度{}\t内容：\n{:x?}", len, &packet_buf);
+
+                                socket
+                                    .try_clone()
+                                    .unwrap()
+                                    .send_to(&packet_buf, addr)
+                                    .unwrap();
+                            }
+                        }
+                    }
+                } else if is_rtcp(&buf) {
+                    // rtcp数据
+                    unsafe {
+                        let ret = srtp_unprotect_rtcp(
+                            s.clone(),
+                            packet.as_mut_ptr() as *mut c_void,
+                            &mut len,
+                        );
+                        if ret != 0 {
+                            panic!("解析 rtcp 返回值: {}, 数据：\n{:x?}\n", ret, &packet);
+                        }
+                    }
+
+                    let rtcp_data = &packet[..len as usize];
+                    println!("解密后: 长度{}\t内容：\n{:x?}\n", len, rtcp_data);
                 }
             }
         }
@@ -376,6 +384,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     h.await.unwrap();
     Ok(())
+}
+
+fn is_rtp(buf: &[u8]) -> bool {
+    buf[1] < 200u8 && buf[0] == 0x80u8
+}
+
+fn is_rtcp(buf: &[u8]) -> bool {
+    buf[1] >= 200u8 && buf[0] == 0x80u8
 }
 
 #[derive(Debug)]
